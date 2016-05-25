@@ -20,16 +20,16 @@ import scodec.bits.ByteVector
 /**
 this is a class that allows you to easily put a list of stuff into postgres. It uses introspection to 
 determine what the name of the data columns should be, based on your Case class. For example: 
-{{
-	case class Fruit(name:String, count:Int)
-	val fruitData = List(Fruit("apple", 10), Fruit("banana", 50))
-	val pgw = new pgWriter[Fruit]("my_awesome_app")
-	pgw.copyToTable("fruit_data", fruitData)
-}}
+{{{
+case class Fruit(name:String, count:Int)
+val fruitData = List(Fruit("apple", 10), Fruit("banana", 50))
+val pgw = new pgWriter[Fruit]("my_awesome_app") // useful for looking at pg_stat_activity
+pgw.copyToTable("fruit_data", fruitData) // DB has a table called fruit data, with columns name and count.
+}}}
 This will automagically copy the contents of the List to the table {{fruit_data}}, filling in the columns
-{{name}} and {{ count }}. Exceptions are not handled, so if those columns don't exist, things blow up!
+`name` and `count`. Exceptions are not handled, so if those columns don't exist, things blow up!
 @constructor create a new PG Writer
-@param T type parameter to know what columns should be called
+@tparam T type parameter to know what columns should be called
 @param pPort optional postgres port
 @param pHosts optional list of postgres servers (will chose 1 at random - useful for clusters)
 @param pUser user to use for writes
@@ -108,7 +108,7 @@ pUser:Option[String] = None, pPassword:Option[String] = None, pDb:Option[String]
 	
 	/**
 	the function that actually executes the copy.
-	@param tn the table name (in {{pDb}}) to copy to.
+	@param tn the table name (in `pDb`) to copy to.
 	@param inp list to copy into postgres - type T (case classes)
 	*/
 	def copyToTable(tn:String, inp:List[T]) = {
