@@ -10,6 +10,7 @@ import org.apache.spark.streaming.receiver._
 /**
 A really simple HTTP receiver for use in Spark Streaming. I used it to receive a stream of events in JSON format! 
 Try using a bunch of them if you have a bunch of data!
+@constructor create a new HTTP receiver 
 @param url The URL to receive
 @param httpParams Optional HTTP parameters (e.g. special headers you might want)
 @param proxy Proxy settings
@@ -41,7 +42,7 @@ class simpleHttpReciever(url: String, httpParams:Option[Map[Any, Any]] = None, p
 	private def receive() {
 		try {
 			// Connect to host:port
-			val httpRequest = Http(url)
+			var httpRequest = Http(url)
 			if (proxy.nonEmpty) {
 				httpRequest = httpRequest.proxy(proxy.get._1, proxy.get._2)
 			}
@@ -55,7 +56,7 @@ class simpleHttpReciever(url: String, httpParams:Option[Map[Any, Any]] = None, p
 			// Until stopped or connection broken continue reading
 			httpRequest.execute(parser = { inputStream =>
 				val reader = new java.io.BufferedReader(new java.io.InputStreamReader(inputStream))
-				val inputLine = reader.readLine()
+				var inputLine = reader.readLine()
 				while(!isStopped && inputLine != null) {
 					store(inputLine)
 					inputLine = reader.readLine()
