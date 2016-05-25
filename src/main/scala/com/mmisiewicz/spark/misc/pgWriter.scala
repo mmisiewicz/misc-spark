@@ -107,7 +107,7 @@ pUser:Option[String] = None, pPassword:Option[String] = None, pDb:Option[String]
 	}
 	
 	/**
-	the function that actually executes the copy.
+	the method that actually executes the copy.
 	@param tn the table name (in `pDb`) to copy to.
 	@param inp list to copy into postgres - type T (case classes)
 	*/
