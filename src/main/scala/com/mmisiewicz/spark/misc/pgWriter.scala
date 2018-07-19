@@ -1,134 +1,142 @@
 package com.mmisiewicz.spark.misc
 
-import org.apache.spark._ // for Logging, since this is intended to be used in spark...
-
-import java.util.Properties
-import scala.util.Random
 import scala.collection.mutable.ListBuffer
-
 import doobie.imports._
+
 import scalaz._
 import Scalaz._
 import scalaz.stream._
 import scalaz.concurrent.Task
-import doobie.contrib.postgresql.pgtypes._
-import doobie.contrib.postgresql.imports._
-import doobie.contrib.postgresql.free.copymanager.copyIn
-import doobie.contrib.postgresql.hi.connection.pgGetCopyAPI
+import doobie.postgres.imports._
 import scodec.bits.ByteVector
+import org.slf4j.LoggerFactory
 
 /**
-this is a class that allows you to easily put a list of stuff into postgres. It uses introspection to 
-determine what the name of the data columns should be, based on your Case class. For example: 
-{{{
-case class Fruit(name:String, count:Int)
-val fruitData = List(Fruit("apple", 10), Fruit("banana", 50))
-val pgw = new pgWriter[Fruit]("my_awesome_app") // useful for looking at pg_stat_activity
-pgw.copyToTable("fruit_data", fruitData) // DB has a table called fruit data, with columns name and count.
-}}}
-This will automagically copy the contents of the List to the table {{fruit_data}}, filling in the columns
-`name` and `count`. Exceptions are not handled, so if those columns don't exist, things blow up!
-@constructor create a new PG Writer
-@tparam T type parameter to know what columns should be called
-@param pPort optional postgres port
-@param pHosts optional list of postgres servers (will chose 1 at random - useful for clusters)
-@param pUser user to use for writes
-@param pPassword definitely NOT 12345 on my server. That's for sure.
-@param pDb postgres DB to write to
+  * pgWriter is a class that allows you to quickly put a List of Case Clases into SIGINT postgres. It uses reflection
+  * to figure out what the column names are, by examining the names of the member fields. Ideally it should save you
+  * trouble! It also uses Scalaz streams and Doobie to make the writes nonblocking. Neat!
+  * NB: if any of `pUser`, `pPassword` or `pDb` is specified, all 3 must be.
+  * if I say
+  * ``` case class Person(name:String, age:Int) ```
+  * and I have say:
+  * ``` val people = List(Person("Michael", 29)) ```
+  * what will happen is `PGWriter` will do this:
+  * ``` COPY into tablename (name, age) ```
+  * (and then the actual data)
+  * so it just looks at the definition of the class `Person` and sees the field name, and age, and uses that to construct a copy command
+  *
+  * @tparam T The case class of your results. Will be used to determine column names.
+  * @param appName The name for your application in Postgres. (only shows up in `pg_stat_activity` for administrators)
+  */
+case class PGWriter[T](appName: String,
+                       database: String,
+                       pgAuth: String => PGAuth) {
 
-*/
-class PGWriter[T](appName:String, pPort:Option[Int] = None, pHosts:Option[List[String]] = None,
-pUser:Option[String] = None, pPassword:Option[String] = None, pDb:Option[String] = None) extends org.apache.spark.Logging {
-    // Read config from secrets file in the JAR if parameters not provided
-    private val _pDriver = "org.postgresql.Driver"
-    private val _pPort = if (pPort.isEmpty) 5432 else pPort.get
-    // Muliple hosts are possible.
-    private val _pHosts = if (pHosts.isEmpty) { List("localhost") } else { pHosts.get }
+  private var recordsIn: Array[T] = null
+  private var colNames = List[String]()
+  private var tableName: String = null
+  private val auth = pgAuth(database)
+  private val logger = LoggerFactory.getLogger(this.getClass)
 
-    private val rng = new Random()
-    private val _pHost = _pHosts(rng.nextInt(_pHosts.size)) // Chose a server at random
-    private val prop = new Properties()
-
-    private val (_pPassword, _pDb, _pUser) = if (pDb.isEmpty || pPassword.isEmpty || pUser.isEmpty) {
-        // This code assumes you put your secrets in a file in the resources directory (and presumably,
-        // dont check it into git.)
-        logInfo("Using creds from this jar")
-        prop.load(getClass.getResourceAsStream("/secrets.conf"))
-        (
-            prop.getProperty("pg.password"),
-            prop.getProperty("pg.db"),
-            prop.getProperty("pg.user")
-        )
-    } else {
-        logInfo("Override for Password, DB and User detected!")
-        (pPassword.get, pDb.get, pUser.get)
-    }
-
-    private var recordsIn = List[T]()
-    private var colNames = List[String]()
-    private var tableName:String = null
-
-    private def recordToString(record: T): String = {
-        val fields = (ListBuffer[String]() /: record.getClass.getDeclaredFields) { (a, f) =>
-            f.setAccessible(true)
-            a += f.get(record).toString
+  private def recordToString(record: T): String = {
+    val fields = (ListBuffer[String]() /: record.getClass.getDeclaredFields) { (a, f) =>
+      f.setAccessible(true)
+      val fv: Any = f.get(record)
+      val fStr = fv match {
+        case o: Option[Any] => o match {
+          case Some(ov) => ov.toString
+          case None => "\\N"
         }
-        fields.toList.intercalate("\t")
-    }
-    logInfo("Initialized pgWriter")
-
-    lazy val xa: Transactor[Task] =
-        DriverManagerTransactor(_pDriver,
-        s"jdbc:postgresql://${_pHost}:${_pPort}/${_pDb}?application_name=$appName", _pUser, _pPassword)
-
-    private def stringToByteVector(str: String): ByteVector =
-        ByteVector.view(str.getBytes("UTF-8"))
-
-    private def getColNames() : List[String] = {
-        // return class members for case class
-        val names = (ListBuffer[String]() /: recordsIn(0).getClass.getDeclaredFields) { (a, f) =>
-                f.setAccessible(true)
-                a += f.getName
+        case s: String => s.toString
+        case z: Boolean => z.toString
+        case b: Byte => b.toString
+        case c: Char => c.toString
+        case s: Short => s.toString
+        case i: Int => i.toString
+        case j: Long => j.toString
+        case f: Float => f.toString
+        case d: Double => d.toString
+        case ar: Array[_] => "{\"" + ar.mkString("\",\"") + "\"}"
+        case se: Seq[_] => "{\"" + se.mkString("\",\"") + "\"}"
+        case badHombre => {
+          logger.error("Your case class contains a type that is not supported by PGWriter. \n" +
+            "Supported types are descendants of AnyVal/AnyRef (e.g. Ints, Floats, Longs, etc.), Strings, and Sequences (not sets) \n" +
+            "Sorry! 💩 💩 💩 💩")
+          logger.info(s"The bad data is: ${badHombre.toString}")
+          throw new IllegalArgumentException("Your case class contains a type that is not supported by PGWriter. \n" +
+            "Supported types are descendants of AnyVal/AnyRef (e.g. Ints, Floats, Longs, etc.), Strings, and Sequences (not sets) \n" +
+            "Sorry! 💩 💩 💩 💩")
+          ""
         }
-        names.toList
+      }
+      a += fStr
     }
-    
-    def prog(records: Process[Task, T]): CopyManagerIO[Long] = {
-        val cs = colNames.mkString(",")
-        PFCM.copyIn(
-            s"COPY $tableName ($cs) FROM STDIN DELIMITER '\t'",
-            scalaz.stream.io.toInputStream(
-                records
-                    .map(recordToString)
-                    .intersperse("\n")
-                    .map(stringToByteVector)
-            )
-        )
+    fields.toList.intercalate("\t")
+  }
+
+  logger.info("Initialized pgWriter")
+
+  // scalaz thing that recieves a task
+  lazy val xa: Transactor[Task] = auth.getTransactor
+
+  private def stringToByteVector(str: String): ByteVector = ByteVector.view(str.getBytes("UTF-8"))
+
+  // using reflection here, will fail if there is an empty list
+  private def getColNames: List[String] = {
+    // return class members for case class
+    val names = (ListBuffer[String]() /: recordsIn(0).getClass.getDeclaredFields) { (a, f) =>
+      f.setAccessible(true)
+      a += f.getName
     }
-    
-    /**
-    the method that actually executes the copy.
-    @param tn the table name (in `pDb`) to copy to.
-    @param inp list to copy into postgres - type T (case classes)
+    names.toList
+  }
+
+  // set up the copy statement
+  private def prog(records: Process[Task, T]): CopyManagerIO[Long] = {
+    val cs = colNames.mkString(",")
+    logger.debug(s"COPY $tableName ($cs) FROM STDIN DELIMITER '\t'")
+    PFCM.copyIn(
+      s"COPY $tableName ($cs) FROM STDIN DELIMITER '\t'",
+      scalaz.stream.io.toInputStream(
+        records
+          .map(recordToString)
+          .intersperse("\n")
+          .map(stringToByteVector)
+      )
+    )
+  }
+
+  /**
+    * This makes the copy actually happen, initiating the copy thread. Should be nonblocking.
+    *
+    * @param tn  Table name in postgres XL. e.g.: `user_annotation`
+    * @param inp List of case class instances to insert.
     */
-    def copyToTable(tn:String, inp:List[T]) = {
-        recordsIn = inp
-        colNames = getColNames
-        val cs = colNames.mkString(",")
-        tableName = tn
-        logInfo(s"COPY $tableName ($cs) FROM STDIN DELIMITER '\t'")
-        logInfo("============================================")
-        recordsIn.take(5).map(recordToString).foreach( r => logInfo("\t" + r))
-        logInfo("============================================")
-        val rowProcess: Process[Task, T] =
-            Process.emitAll(recordsIn)
-        val task: Task[Unit] =
-            PHC.pgGetCopyAPI(prog(rowProcess)).transact(xa) >>= { count =>
-                Task.delay{
-                    logInfo(s"$count records inserted")
-                }
-            }
-        // LET IT RIP!
-        task.run
-    }
+  def copyToTable(tn: String, inp: Array[T]) = {
+    this.recordsIn = inp
+    this.colNames = getColNames
+    val cs = this.colNames.mkString(",")
+    this.tableName = tn
+    val rowProcess: Process[Task, T] =
+      Process.emitAll(recordsIn)
+    val task: Task[Unit] =
+      PHC.pgGetCopyAPI(prog(rowProcess)).transact(xa) >>= { count =>
+        Task.delay {
+          logger.info(s"$count records inserted")
+        }
+      }
+    // LET IT RIP!
+    task.run
+    // done
+    logger.info(s"COPY $tableName ($cs) FROM STDIN DELIMITER '\t'")
+    logger.info("============================================")
+    this.recordsIn.take(5).map(recordToString).foreach(r => logger.info("\t" + r))
+    logger.info("============================================")
+
+  }
+
+  def getStatement(tableName: String): String = {
+    val cs = this.colNames.mkString(",")
+    s"COPY $tableName ($cs) FROM STDIN DELIMITER '\t'"
+  }
 }

@@ -1,6 +1,6 @@
 name := "spark-misc"
 
-version := "0.1-SNAPSHOT"
+version := "0.0.2"
 
 scalaVersion := "2.11.8"
 
@@ -12,6 +12,8 @@ libraryDependencies += "org.apache.spark" % "spark-streaming_2.11" % "2.3.1" % "
 
 libraryDependencies +=  "org.scalaj" %% "scalaj-http" % "2.4.0"
 
-libraryDependencies += "org.tpolecat" %% "doobie-core" % "0.5.3"
+libraryDependencies += "org.tpolecat" %% "doobie-core" % "0.4.4"
 
-libraryDependencies += "org.tpolecat" %% "doobie-postgres" % "0.5.3"
+libraryDependencies += "org.tpolecat" %% "doobie-postgres" % "0.4.4"
+
+libraryDependencies += "org.slf4j" % "slf4j-api" % "1.7.21"
