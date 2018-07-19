@@ -3,3 +3,4 @@ project/target/*
 project/project/*
 log/*
 .ensime
+.ensime_cache
